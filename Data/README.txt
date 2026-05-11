@@ -1,2 +1,0 @@
-This folder contains the exported data from GEE which includes: Soil moisture, precipitation, Max temperature, and poppy area in "CSV" format
-and the PNG image of the graphs for each season. A JMP graph was also build and kept in its representative season folder.
