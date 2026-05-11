@@ -1,0 +1,751 @@
+// GEE code link: https://code.earthengine.google.com/f2462fcfa399a4f63fb3073b9a24c23e
+//copy and paste below into GEE along with GEEPOINTS file to get points for training and area of interest
+
+//==================================================================
+//functions
+//==================================================================
+// Function to mask pixels with low CS+ QA scores.
+function maskLowQA(image) {
+  var qaBand = 'cs';
+  var clearThreshold = 0.5;
+  var mask = image.select(qaBand).gte(clearThreshold);
+  return image.updateMask(mask);
+}
+
+//addNdvi function
+function addNdvi(image) {
+  var ndvi = image.normalizedDifference(['B8','B4']).rename("ndvi");
+  return image.addBands(ndvi)
+}
+
+//function that adds time variables
+var addVars = function(image) {
+  //to compute time since the epoch date
+  var date = image.date();
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  image = image
+  //adding time and constant band
+  .addBands(ee.Image(years).rename('t')).float()
+  .addBands(ee.Image.constant(1));
+  return image 
+}
+
+
+// following functions work together ====
+//function to classify images over time with trained classifier
+var classifyImages = function(image){
+  var classified = image.classify(classifier).rename('classification');
+  return classified.copyProperties(image, ['system:time_start', 'system:time_end','t']);
+}
+
+//function for calculating poppy area 
+var poppyArea = function(image) {
+  var poppyMask = image.eq(0);
+  var poppyPixel = ee.Image.pixelArea().updateMask(poppyMask);
+  var area = poppyPixel.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: AOI,
+    scale: 10,
+    maxPixels: 1e10
+    });
+
+  return image.set('poppyAreaSqKm', ee.Number(area.get('area')).divide(1e6));
+}
+//=======================================
+
+//==================================================================
+//color palettes for layers
+//==================================================================
+var rgbVis = {
+  min: 0.0,
+  max: 3000,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+var ndviVis = {
+  min:0.0,
+  max:1.0,
+  palette: ['white', 'darkgreen']
+}
+//==================================================================
+//1 defining area of interest and importing sentinel 2
+//==================================================================
+var geo = geom;
+var AOI = geo.bounds();
+
+//dates for classifier
+var startDate = '2019-04-01';
+var endDate = '2019-04-30';
+
+//importing sentinel 2
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
+var filtered = s2
+  //.filterDate(startDate, endDate)
+  .filter(ee.Filter.bounds(AOI))
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .select('B.*');
+  
+ // Load the Cloud Score+ collection
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var csPlusBands = csPlus.first().bandNames();
+
+//cloud scoreplus
+var filteredS2WithCs = filtered.linkCollection(csPlus, csPlusBands);
+//masking out clouds
+var filteredMasked = filteredS2WithCs
+  .map(maskLowQA)
+  .select('B.*');
+  
+//classifier composition based on 2019
+var classifierComp2019 = filteredMasked.filterDate(startDate, endDate).median();
+var classifierComp2019 = addNdvi(classifierComp2019);
+
+Map.centerObject(AOI, 11)
+Map.addLayer(classifierComp2019.clip(AOI), rgbVis, 'RGB image',0);
+Map.addLayer(classifierComp2019.select("ndvi").clip(AOI), ndviVis, "NDVI" ,0)
+
+//==================================================================
+//1.2 importing PRISM precipitation dataset
+//==================================================================
+//dataset: https://developers.google.com/earth-engine/datasets/catalog/OREGONSTATE_PRISM_ANd#bands
+//1981-2026
+var prism = ee.ImageCollection("OREGONSTATE/PRISM/ANd")
+  //.filter(ee.Filter.date('2019-12-01', '2020-01-31'))
+  .filter(ee.Filter.bounds(AOI));
+  
+//mapping out prism precipitation
+var prismtst = ee.ImageCollection("OREGONSTATE/PRISM/ANd")
+              .filter(ee.Filter.date('2019-12-01', '2020-01-31'))
+              .filter(ee.Filter.bounds(AOI))
+              .select("ppt")
+              .mean();              
+Map.addLayer(prismtst.clip(AOI), {min:0,max:5, palette: ["red", "orange","yellow", "green", "blue"]}, "prism ppt mm/day",0)
+
+
+//==================================================================
+// importing SMAP soil moisture am 
+//==================================================================
+//lab 5 option2 
+// https://developers.google.com/earth-engine/tutorials/community/anomalies-analysis-smo-and-pre
+// 2015-2023
+//https://developers.google.com/earth-engine/datasets/catalog/NASA_SMAP_SPL3SMP_E_006
+//2023-2026
+//https://developers.google.com/earth-engine/datasets/catalog/NASA_SMAP_SPL3SMP_E_005#description
+//Enhanced soil moisture datasets.
+
+//2015 to 2023 smap
+var smap = ee.ImageCollection("NASA/SMAP/SPL3SMP_E/005") //ee.ImageCollection("NASA/SMAP/SPL4SMGP/008") //ee.ImageCollection("NASA/SMAP/SPL3SMP_E/005");
+  .filter(ee.Filter.bounds(AOI))
+  .select('soil_moisture_am');
+
+//2023 to 2026 smap
+var smap2023 = ee.ImageCollection("NASA/SMAP/SPL3SMP_E/006")
+  .filter(ee.Filter.bounds(AOI))
+  .select('soil_moisture_am');
+//==================================================================
+// 2 poppy classifier
+//==================================================================
+
+var stackedImage = classifierComp2019//.addBands(comp2017);
+
+var poppy = ee.FeatureCollection(poppy)
+  .map(function(f){ return f.set('class', 0); });
+var goldfields = ee.FeatureCollection(goldfields)
+  .map(function(f){ return f.set('class', 1); });
+var bareSoil = ee.FeatureCollection(bareSoil)
+  .map(function(f){ return f.set('class', 2); });
+var veg = ee.FeatureCollection(veg)
+  .map(function(f){ return f.set('class', 3); });
+var npv = ee.FeatureCollection(npv)
+  .map(function(f){ return f.set('class', 4); });
+var urban = ee.FeatureCollection(urban)
+  .map(function(f){ return f.set('class', 5); });
+var water = ee.FeatureCollection(water)
+  .map(function(f){ return f.set('class', 6); });
+
+//merging classifier points 
+var points = poppy.merge(goldfields).merge(bareSoil).merge(veg).merge(urban).merge(npv).merge(water);
+
+//creating training and testing data sets 80/20
+var seed = 42;
+var randomSeed = points.randomColumn('random', seed);
+var trainingCollection = randomSeed.filter(ee.Filter.lt('random',0.8));
+var testingCollection = randomSeed.filter(ee.Filter.gte('random',0.8));
+
+// Overlay the point on the image to get training data.
+var training = stackedImage.sampleRegions({
+  collection: trainingCollection,
+  properties: ['class'], 
+  scale: 10
+});
+
+// Train a classifier.
+var classifier = ee.Classifier.smileRandomForest(100).train({
+  features: training,  
+  classProperty: 'class', 
+  inputProperties: stackedImage.bandNames()
+});
+
+// Classify the image.
+var classified = stackedImage.classify(classifier);
+Map.addLayer(classified.clip(AOI),
+  {min: 0, max: 6, palette: ['orange', 'gold','#a83a32','green','9e916f','purple','blue']}, 'classified image',0); 
+// classified image colors
+// poppy: orange
+// goldfield: gold
+// bare soil: clay
+// vegetation: green
+// npv: sand
+// urban: purple
+// water : blue
+
+//create layer with poppy mask
+var classifiedpoppy = classified.eq(0).selfMask()
+Map.addLayer(classifiedpoppy.clip(AOI),{palette: ['orange']},'Classified Poppy',0);
+//creating a layer with goldfield mask
+var classifiedgold = classified.eq(1).selfMask()
+Map.addLayer(classifiedgold.clip(AOI), {palette: ['gold']}, 'Classified Goldfield',0);
+
+
+//==================================================================
+//  validation of classifier
+//==================================================================
+var trainAccuracy = classifier.confusionMatrix();
+print('Error Matrix:', trainAccuracy);
+print('Training overall accuracy: ', trainAccuracy.accuracy());
+
+var testing = stackedImage.sampleRegions({
+  collection: testingCollection,
+  properties: ['class'],
+  scale:10
+})
+var validated = testing.classify(classifier);
+
+// Get a confusion matrix representing expected accuracy.
+var testAccuracy = validated.errorMatrix('class', 'classification');
+print('Validation error matrix: ', testAccuracy);
+print('Validation overall accuracy: ', testAccuracy.accuracy());
+
+//==================================================================
+//  calculate area of AOI
+//==================================================================
+
+// area of the study area (AOI)
+var antelopeValleyarea = AOI.area({maxError: 1e6}); //area of AOI in m^2
+var antelopeValleySqKm = ee.Number(antelopeValleyarea).divide(1e6).round(); //square km of AOI
+print(antelopeValleyarea, "Sq m");
+print(antelopeValleySqKm, "Sq km")
+
+
+// //==================================================================
+// //plotting of variables over time for low bloom year
+// //==================================================================
+// //bloom low
+// var startDateBloomLow = ee.Date('2023-10-01');
+// var endDateBloomLow = ee.Date('2024-06-01');
+
+
+// //chart for s2 NDVI
+// var filteredImg = filteredMasked
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloomLow,endDateBloomLow)
+//   .map(addVars)
+//   .map(addNdvi);
+//   var s2Chart = ui.Chart.image.series({
+//   imageCollection: filteredImg.select('ndvi'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       color: 'green',
+//       title: 'Sentinel 2 NDVI Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'NDVI and ppt'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(s2Chart)
+
+// //chart for prism ppt
+// var filteredprism = prism
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloomLow, endDateBloomLow)
+//   .map(addVars);
+// var prismPptChart = ui.Chart.image.series({
+//   imageCollection: filteredprism.select('ppt'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'PRISM ppt Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'precipitation [mm/day]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(prismPptChart)
+// //chart for prism max temp
+// var prismMaxTempChart = ui.Chart.image.series({
+//   imageCollection: filteredprism.select('tmax'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'PRISM Max Temp Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Max Temperature [C]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(prismMaxTempChart)
+
+// //chart for smap soil moisture 
+// var combinedSmap = smap.filterDate(startDateBloomLow,'2023-12-04').merge(smap2023.filterDate('2023-12-04',endDateBloomLow)).sort('system:time_start')
+// var filteredSmap = smap2023
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloomLow, endDateBloomLow)
+//   .map(addVars)
+// var smapChart = ui.Chart.image.series({
+//   imageCollection: filteredSmap.select('soil_moisture_am'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'SMAP soil moisture Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Soil moisture fraction'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(smapChart)
+
+// //chart for poppy area
+// var filteredPoppy = filteredMasked
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloomLow, endDateBloomLow)
+//   .map(addNdvi)
+//   .map(addVars);
+
+// var classifiedPoppyArea = filteredPoppy
+//   .map(classifyImages)
+//   .map(poppyArea)
+// print(classifiedPoppyArea)
+// var poppyAreaChart = ui.Chart.feature.byFeature({
+//   features: classifiedPoppyArea,//.select('poppyAreaSqKm'),
+//   //region: AOI,
+//   //reducer: ee.Reducer.mean(),
+//   //scale: 30
+//   xProperty: 'system:time_start',
+//   yProperties: ['poppyAreaSqKm']
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'Poppy area Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Poppy Area [Sq Km]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(poppyAreaChart)
+
+
+
+
+//===================================================================
+//plotting of variables over time for bloom 1
+//===================================================================
+//bloom1
+var startDateBloom1 = ee.Date('2018-10-01');
+var endDateBloom1 = ee.Date('2019-06-01');
+
+
+//chart for s2 NDVI
+var filteredImg = filteredMasked
+  .filterBounds(AOI)
+  .filterDate(startDateBloom1,endDateBloom1)
+  .map(addVars)
+  .map(addNdvi);
+  var s2Chart = ui.Chart.image.series({
+  imageCollection: filteredImg.select('ndvi'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+}).setOptions({
+      lineWidth: 1,
+      pointSize: 2,
+      color: 'green',
+      title: 'Sentinel 2 NDVI Time Series',
+      interpolateNulls: false,
+      vAxis: {title: 'NDVI and ppt'},
+      hAxis: {title: '', format: 'YYYY-MMM'}
+    });
+print(s2Chart)
+
+//chart for prism ppt
+var filteredprism = prism
+  .filterBounds(AOI)
+  .filterDate(startDateBloom1, endDateBloom1)
+  .map(addVars);
+var prismPptChart = ui.Chart.image.series({
+  imageCollection: filteredprism.select('ppt'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+}).setOptions({
+      lineWidth: 1,
+      pointSize: 2,
+      title: 'PRISM ppt Time Series',
+      interpolateNulls: false,
+      vAxis: {title: 'precipitation [mm/day]'},
+      hAxis: {title: '', format: 'YYYY-MMM'}
+    });
+print(prismPptChart)
+//chart for prism max temp
+var prismMaxTempChart = ui.Chart.image.series({
+  imageCollection: filteredprism.select('tmax'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+}).setOptions({
+      lineWidth: 1,
+      pointSize: 2,
+      title: 'PRISM Max Temp Time Series',
+      interpolateNulls: false,
+      vAxis: {title: 'Max Temperature [C]'},
+      hAxis: {title: '', format: 'YYYY-MMM'}
+    });
+print(prismMaxTempChart)
+
+//chart for smap soil moisture 
+var filteredSmap = smap
+  .filterBounds(AOI)
+  .filterDate(startDateBloom1, endDateBloom1)
+  .map(addVars)
+var smapChart = ui.Chart.image.series({
+  imageCollection: filteredSmap.select('soil_moisture_am'),
+  region: AOI,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+}).setOptions({
+      lineWidth: 1,
+      pointSize: 2,
+      title: 'SMAP soil moisture Time Series',
+      interpolateNulls: false,
+      vAxis: {title: 'Soil moisture fraction'},
+      hAxis: {title: '', format: 'YYYY-MMM'}
+    });
+print(smapChart)
+
+//chart for poppy area
+var filteredPoppy = filteredMasked
+  .filterBounds(AOI)
+  .filterDate(startDateBloom1, endDateBloom1)
+  .map(addNdvi)
+  .map(addVars);
+
+var classifiedPoppyArea = filteredPoppy
+  .map(classifyImages)
+  .map(poppyArea)
+print(classifiedPoppyArea)
+var poppyAreaChart = ui.Chart.feature.byFeature({
+  features: classifiedPoppyArea,//.select('poppyAreaSqKm'),
+  //region: AOI,
+  //reducer: ee.Reducer.mean(),
+  //scale: 30
+  xProperty: 'system:time_start',
+  yProperties: ['poppyAreaSqKm']
+}).setOptions({
+      lineWidth: 1,
+      pointSize: 2,
+      title: 'Poppy area Time Series',
+      interpolateNulls: false,
+      vAxis: {title: 'Poppy Area [Sq Km]'},
+      hAxis: {title: '', format: 'YYYY-MMM'}
+    });
+print(poppyAreaChart)
+
+
+// //====================================================================2
+// //plotting of variables over time for bloom 2
+// //====================================================================2
+// //bloom2
+// var startDateBloom2 = ee.Date('2022-10-01');
+// var endDateBloom2 = ee.Date('2023-06-01');
+
+
+// //chart for s2 NDVI
+// var filteredImg = filteredMasked
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom2,endDateBloom2)
+//   .map(addVars)
+//   .map(addNdvi);
+//   var s2Chart = ui.Chart.image.series({
+//   imageCollection: filteredImg.select('ndvi'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       color: 'green',
+//       title: 'Sentinel 2 NDVI Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'NDVI and ppt'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(s2Chart)
+
+// //chart for prism ppt
+// var filteredprism = prism
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom2, endDateBloom2)
+//   .map(addVars);
+// var prismPptChart = ui.Chart.image.series({
+//   imageCollection: filteredprism.select('ppt'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'PRISM ppt Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'precipitation [mm/day]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(prismPptChart)
+// //chart for prism max temp
+// var prismMaxTempChart = ui.Chart.image.series({
+//   imageCollection: filteredprism.select('tmax'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'PRISM Max Temp Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Max Temperature [C]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(prismMaxTempChart)
+
+// //chart for smap soil moisture 
+// var filteredSmap = smap
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom2, endDateBloom2)
+//   .map(addVars)
+// var smapChart = ui.Chart.image.series({
+//   imageCollection: filteredSmap.select('soil_moisture_am'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'SMAP soil moisture Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Soil moisture fraction'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(smapChart)
+
+// //chart for poppy area
+// var filteredPoppy = filteredMasked
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom2, endDateBloom2)
+//   .map(addNdvi)
+//   .map(addVars);
+
+// var classifiedPoppyArea = filteredPoppy
+//   .map(classifyImages)
+//   .map(poppyArea)
+// print(classifiedPoppyArea)
+// var poppyAreaChart = ui.Chart.feature.byFeature({
+//   features: classifiedPoppyArea,//.select('poppyAreaSqKm'),
+//   //region: AOI,
+//   //reducer: ee.Reducer.mean(),
+//   //scale: 30
+//   xProperty: 'system:time_start',
+//   yProperties: ['poppyAreaSqKm']
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'Poppy area Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Poppy Area [Sq Km]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(poppyAreaChart)
+
+
+
+// //=====================================================================3
+// //plotting of variables over time for bloom 3
+// //=====================================================================3
+// //bloom3
+// var startDateBloom3 = ee.Date('2025-10-01');
+// var endDateBloom3 = ee.Date('2026-06-01');
+
+
+// //chart for s2 NDVI
+// var filteredImg = filteredMasked
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom3,endDateBloom3)
+//   .map(addVars)
+//   .map(addNdvi);
+//   var s2Chart = ui.Chart.image.series({
+//   imageCollection: filteredImg.select('ndvi'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       color: 'green',
+//       title: 'Sentinel 2 NDVI Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'NDVI and ppt'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(s2Chart)
+
+// //chart for prism ppt
+// var filteredprism = prism
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom3, endDateBloom3)
+//   .map(addVars);
+// var prismPptChart = ui.Chart.image.series({
+//   imageCollection: filteredprism.select('ppt'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'PRISM ppt Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'precipitation [mm/day]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(prismPptChart)
+// //chart for prism max temp
+// var prismMaxTempChart = ui.Chart.image.series({
+//   imageCollection: filteredprism.select('tmax'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'PRISM Max Temp Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Max Temperature [C]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(prismMaxTempChart)
+
+// //chart for smap soil moisture 
+// var filteredSmap = smap2023
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom3, endDateBloom3)
+//   .map(addVars)
+// var smapChart = ui.Chart.image.series({
+//   imageCollection: filteredSmap.select('soil_moisture_am'),
+//   region: AOI,
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'SMAP soil moisture Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Soil moisture fraction'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(smapChart)
+
+// //chart for poppy area
+// var filteredPoppy = filteredMasked
+//   .filterBounds(AOI)
+//   .filterDate(startDateBloom3, endDateBloom3)
+//   .map(addNdvi)
+//   .map(addVars);
+
+// var classifiedPoppyArea = filteredPoppy
+//   .map(classifyImages)
+//   .map(poppyArea)
+// print(classifiedPoppyArea)
+// var poppyAreaChart = ui.Chart.feature.byFeature({
+//   features: classifiedPoppyArea,//.select('poppyAreaSqKm'),
+//   //region: AOI,
+//   //reducer: ee.Reducer.mean(),
+//   //scale: 30
+//   xProperty: 'system:time_start',
+//   yProperties: ['poppyAreaSqKm']
+// }).setOptions({
+//       lineWidth: 1,
+//       pointSize: 2,
+//       title: 'Poppy area Time Series',
+//       interpolateNulls: false,
+//       vAxis: {title: 'Poppy Area [Sq Km]'},
+//       hAxis: {title: '', format: 'YYYY-MMM'}
+//     });
+// print(poppyAreaChart)
+
+//==================================================================
+// investigation panel
+//==================================================================
+var investigationDate = ee.Date('2019-04-14');
+var investigationDateEnd = investigationDate.advance(1,'day');
+var compinvestigation = filteredMasked.filterDate(investigationDate, investigationDateEnd).median();
+var compinvestigation = addNdvi(compinvestigation);
+var investigationclassified = compinvestigation.classify(classifier);
+var investigationPoppy = investigationclassified.eq(0).selfMask()
+Map.addLayer(compinvestigation.clip(AOI), rgbVis, 'RGB image investigation',0);
+Map.addLayer(compinvestigation.clip(AOI).select('ndvi'), ndviVis, 'ndvi investigation',0)
+Map.addLayer(
+  investigationPoppy.clip(AOI),
+  {palette: ['orange']},
+  'Classified Poppy investigation',0)
+
+//==================================================================
+//export 
+//==================================================================
+// Create a task that you can launch from the Tasks tab.
+Export.image.toDrive({
+  image: compinvestigation.clip(AOI).visualize(rgbVis), //Object to export
+  folder: 'es252s26_GEE/poppy',
+  description: 'peakBloom2019', //Name of the file
+  scale: 10, //Spatial resolution of the exported raster
+  maxPixels: 1e10,
+  region: AOI //Area of interest
+});
+
+Export.image.toDrive({
+  image: investigationPoppy.clip(AOI), //Object to export
+  folder: 'es252s26_GEE/poppy',
+  description: 'peakBloomMask2019', //Name of the file
+  scale: 10, //Spatial resolution of the exported raster
+  maxPixels: 1e10,
+  region: AOI //Area of interest
+});
+
+Export.table.toDrive({
+  collection: points,
+  folder: 'es252s26_GEE/poppy',
+  description: 'exportedTrainingPoints',
+  fileFormat: 'CSV', // Options: CSV, SHP, GeoJSON, KML, KMZ
+  selectors: ['longitude', 'latitude', 'propertyName'] // Optional: Select columns
+});
+
+Export.table.toDrive({
+  collection: geom,
+  folder: 'es252s26_GEE/poppy',
+  description: 'exportedGeometry',
+  fileFormat: 'CSV', // Options: CSV, SHP, GeoJSON, KML, KMZ
+  selectors: ['longitude', 'latitude', 'propertyName'] // Optional: Select columns
+});
